@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -43,12 +44,12 @@ func CheckConfig(cfg *config.Config) gin.HandlerFunc {
 		checked := 0
 
 		// === NapCat onebot11.json checks ===
-		napcatIssues, napcatChecked := checkNapCatConfig()
+		napcatIssues, napcatChecked := checkNapCatConfig(cfg)
 		issues = append(issues, napcatIssues...)
 		checked += napcatChecked
 
 		// === NapCat webui.json checks ===
-		webuiIssues, webuiChecked := checkNapCatWebUI()
+		webuiIssues, webuiChecked := checkNapCatWebUI(cfg)
 		issues = append(issues, webuiIssues...)
 		checked += webuiChecked
 
@@ -110,7 +111,7 @@ func FixConfig(cfg *config.Config) gin.HandlerFunc {
 			}
 		}
 		if napcatRestart {
-			go exec.Command("docker", "restart", "openclaw-qq").Run()
+			go restartNapCatProcess(cfg)
 		}
 
 		c.JSON(http.StatusOK, gin.H{
@@ -124,27 +125,58 @@ func FixConfig(cfg *config.Config) gin.HandlerFunc {
 
 // --- NapCat onebot11.json ---
 
-func readNapCatOneBot11() (map[string]interface{}, string, error) {
-	// Try reading from Docker container
-	out, err := exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/onebot11.json").Output()
+// napCatConfigPath returns the NapCat config file path based on platform
+func napCatConfigPath(cfg *config.Config, filename string) (string, error) {
+	if runtime.GOOS == "windows" {
+		napcatDir := getNapCatShellDir(cfg)
+		if napcatDir == "" {
+			return "", fmt.Errorf("NapCat Shell 未安装")
+		}
+		return filepath.Join(napcatDir, "config", filename), nil
+	}
+	return "", nil // Docker mode, path handled differently
+}
+
+func readNapCatOneBot11(cfg *config.Config) (map[string]interface{}, string, error) {
+	var out []byte
+	var err error
+	var filePath string
+
+	if runtime.GOOS == "windows" {
+		p, perr := napCatConfigPath(cfg, "onebot11.json")
+		if perr != nil {
+			return nil, "", perr
+		}
+		filePath = p
+		out, err = os.ReadFile(p)
+	} else {
+		filePath = "/app/napcat/config/onebot11.json (Docker: openclaw-qq)"
+		out, err = exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/onebot11.json").Output()
+	}
 	if err != nil {
-		return nil, "", fmt.Errorf("无法读取 NapCat onebot11.json: %v", err)
+		return nil, filePath, fmt.Errorf("无法读取 NapCat onebot11.json: %v", err)
 	}
 	var data map[string]interface{}
 	if err := json.Unmarshal(out, &data); err != nil {
-		return nil, "", fmt.Errorf("onebot11.json 解析失败: %v", err)
+		return nil, filePath, fmt.Errorf("onebot11.json 解析失败: %v", err)
 	}
-	return data, "/app/napcat/config/onebot11.json (Docker: openclaw-qq)", nil
+	return data, filePath, nil
 }
 
-func checkNapCatConfig() ([]ConfigIssue, int) {
+func checkNapCatConfig(cfg *config.Config) ([]ConfigIssue, int) {
 	var issues []ConfigIssue
 	checked := 0
 
-	data, filePath, err := readNapCatOneBot11()
+	data, filePath, err := readNapCatOneBot11(cfg)
 	if err != nil {
-		// Container might not exist
-		if isDockerContainerExists("openclaw-qq") {
+		// Check if NapCat is installed at all
+		napcatInstalled := false
+		if runtime.GOOS == "windows" {
+			napcatInstalled = getNapCatShellDir(cfg) != ""
+		} else {
+			napcatInstalled = isDockerContainerExists("openclaw-qq")
+		}
+		if napcatInstalled {
 			issues = append(issues, ConfigIssue{
 				ID: "napcat-onebot11-missing", Severity: "error", Component: "napcat",
 				Title: "onebot11.json 配置文件不存在或无法读取",
@@ -254,15 +286,35 @@ func checkNapCatConfig() ([]ConfigIssue, int) {
 
 // --- NapCat webui.json ---
 
-func checkNapCatWebUI() ([]ConfigIssue, int) {
+func checkNapCatWebUI(cfg *config.Config) ([]ConfigIssue, int) {
 	var issues []ConfigIssue
 	checked := 0
 
-	if !isDockerContainerExists("openclaw-qq") {
-		return issues, 0
+	// Check if NapCat is installed
+	if runtime.GOOS == "windows" {
+		if getNapCatShellDir(cfg) == "" {
+			return issues, 0
+		}
+	} else {
+		if !isDockerContainerExists("openclaw-qq") {
+			return issues, 0
+		}
 	}
 
-	out, err := exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
+	var out []byte
+	var err error
+	var filePath string
+	if runtime.GOOS == "windows" {
+		p, perr := napCatConfigPath(cfg, "webui.json")
+		if perr != nil {
+			return issues, 0
+		}
+		filePath = p
+		out, err = os.ReadFile(p)
+	} else {
+		filePath = "/app/napcat/config/webui.json (Docker: openclaw-qq)"
+		out, err = exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
+	}
 	if err != nil {
 		return issues, 0
 	}
@@ -281,7 +333,7 @@ func checkNapCatWebUI() ([]ConfigIssue, int) {
 			Title: "NapCat WebUI Token 为空",
 			Description: "WebUI 没有设置访问令牌，ClawPanel 可能无法调用 NapCat 管理 API",
 			Fixable: true, CurrentVal: "(空)", ExpectedVal: "clawpanel-qq",
-			FilePath: "/app/napcat/config/webui.json (Docker: openclaw-qq)",
+			FilePath: filePath,
 		})
 	}
 
@@ -439,27 +491,27 @@ func checkPortConflicts() ([]ConfigIssue, int) {
 func fixIssue(issueID string, cfg *config.Config) error {
 	switch {
 	case issueID == "napcat-onebot11-missing" || issueID == "napcat-no-network" || issueID == "napcat-no-ws" || issueID == "napcat-no-http":
-		return writeDefaultOneBot11Config()
+		return writeDefaultOneBot11Config(cfg)
 
 	case strings.HasPrefix(issueID, "napcat-ws-") && strings.HasSuffix(issueID, "-disabled"):
-		return fixNapCatWSField("enable", true)
+		return fixNapCatWSField(cfg, "enable", true)
 	case strings.HasPrefix(issueID, "napcat-ws-") && strings.HasSuffix(issueID, "-noport"):
-		return fixNapCatWSField("port", float64(3001))
+		return fixNapCatWSField(cfg, "port", float64(3001))
 	case strings.HasPrefix(issueID, "napcat-ws-") && strings.HasSuffix(issueID, "-no-self-msg"):
-		return fixNapCatWSField("reportSelfMessage", true)
+		return fixNapCatWSField(cfg, "reportSelfMessage", true)
 
 	case strings.HasPrefix(issueID, "napcat-http-") && strings.HasSuffix(issueID, "-disabled"):
-		return fixNapCatHTTPField("enable", true)
+		return fixNapCatHTTPField(cfg, "enable", true)
 
 	case issueID == "napcat-webui-no-token":
-		return fixNapCatWebUIToken()
+		return fixNapCatWebUIToken(cfg)
 
 	default:
 		return fmt.Errorf("该问题不支持自动修复")
 	}
 }
 
-func writeDefaultOneBot11Config() error {
+func writeDefaultOneBot11Config(cfg *config.Config) error {
 	defaultConfig := `{
   "network": {
     "websocketServers": [{
@@ -491,25 +543,33 @@ func writeDefaultOneBot11Config() error {
   "parseMultMsg": true,
   "imageDownloadProxy": ""
 }`
+	if runtime.GOOS == "windows" {
+		p, err := napCatConfigPath(cfg, "onebot11.json")
+		if err != nil {
+			return err
+		}
+		os.MkdirAll(filepath.Dir(p), 0755)
+		return os.WriteFile(p, []byte(defaultConfig), 0644)
+	}
 	cmd := exec.Command("docker", "exec", "openclaw-qq", "bash", "-c",
 		fmt.Sprintf("cat > /app/napcat/config/onebot11.json << 'FIXEOF'\n%s\nFIXEOF", defaultConfig))
 	return cmd.Run()
 }
 
-func fixNapCatWSField(field string, value interface{}) error {
-	data, _, err := readNapCatOneBot11()
+func fixNapCatWSField(cfg *config.Config, field string, value interface{}) error {
+	data, _, err := readNapCatOneBot11(cfg)
 	if err != nil {
 		return err
 	}
 
 	network, _ := data["network"].(map[string]interface{})
 	if network == nil {
-		return writeDefaultOneBot11Config()
+		return writeDefaultOneBot11Config(cfg)
 	}
 
 	wsServers, _ := network["websocketServers"].([]interface{})
 	if len(wsServers) == 0 {
-		return writeDefaultOneBot11Config()
+		return writeDefaultOneBot11Config(cfg)
 	}
 
 	for _, ws := range wsServers {
@@ -519,23 +579,23 @@ func fixNapCatWSField(field string, value interface{}) error {
 		}
 	}
 
-	return writeNapCatOneBot11(data)
+	return writeNapCatOneBot11(cfg, data)
 }
 
-func fixNapCatHTTPField(field string, value interface{}) error {
-	data, _, err := readNapCatOneBot11()
+func fixNapCatHTTPField(cfg *config.Config, field string, value interface{}) error {
+	data, _, err := readNapCatOneBot11(cfg)
 	if err != nil {
 		return err
 	}
 
 	network, _ := data["network"].(map[string]interface{})
 	if network == nil {
-		return writeDefaultOneBot11Config()
+		return writeDefaultOneBot11Config(cfg)
 	}
 
 	httpServers, _ := network["httpServers"].([]interface{})
 	if len(httpServers) == 0 {
-		return writeDefaultOneBot11Config()
+		return writeDefaultOneBot11Config(cfg)
 	}
 
 	for _, hs := range httpServers {
@@ -545,21 +605,39 @@ func fixNapCatHTTPField(field string, value interface{}) error {
 		}
 	}
 
-	return writeNapCatOneBot11(data)
+	return writeNapCatOneBot11(cfg, data)
 }
 
-func writeNapCatOneBot11(data map[string]interface{}) error {
+func writeNapCatOneBot11(cfg *config.Config, data map[string]interface{}) error {
 	jsonBytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
+	}
+	if runtime.GOOS == "windows" {
+		p, perr := napCatConfigPath(cfg, "onebot11.json")
+		if perr != nil {
+			return perr
+		}
+		os.MkdirAll(filepath.Dir(p), 0755)
+		return os.WriteFile(p, jsonBytes, 0644)
 	}
 	cmd := exec.Command("docker", "exec", "openclaw-qq", "bash", "-c",
 		fmt.Sprintf("cat > /app/napcat/config/onebot11.json << 'FIXEOF'\n%s\nFIXEOF", string(jsonBytes)))
 	return cmd.Run()
 }
 
-func fixNapCatWebUIToken() error {
-	out, err := exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
+func fixNapCatWebUIToken(cfg *config.Config) error {
+	var out []byte
+	var err error
+	if runtime.GOOS == "windows" {
+		p, perr := napCatConfigPath(cfg, "webui.json")
+		if perr != nil {
+			return perr
+		}
+		out, err = os.ReadFile(p)
+	} else {
+		out, err = exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
+	}
 	if err != nil {
 		return err
 	}
@@ -569,6 +647,13 @@ func fixNapCatWebUIToken() error {
 	}
 	data["token"] = "clawpanel-qq"
 	jsonBytes, _ := json.MarshalIndent(data, "", "  ")
+	if runtime.GOOS == "windows" {
+		p, perr := napCatConfigPath(cfg, "webui.json")
+		if perr != nil {
+			return perr
+		}
+		return os.WriteFile(p, jsonBytes, 0644)
+	}
 	cmd := exec.Command("docker", "exec", "openclaw-qq", "bash", "-c",
 		fmt.Sprintf("cat > /app/napcat/config/webui.json << 'FIXEOF'\n%s\nFIXEOF", string(jsonBytes)))
 	return cmd.Run()

@@ -468,21 +468,28 @@ func findNapCatShellDir(cfg *config.Config) string {
 		`C:\NapCat`,
 		filepath.Join(home, "AppData", "Local", "NapCat"),
 	}
+	markers := []string{"napcat.bat", "NapCatWinBootMain.exe"}
 	for _, dir := range candidates {
-		if _, err := os.Stat(filepath.Join(dir, "napcat.bat")); err == nil {
-			return dir
+		if _, err := os.Stat(dir); err != nil {
+			continue
 		}
-		if _, err := os.Stat(filepath.Join(dir, "NapCatWinBootMain.exe")); err == nil {
-			return dir
-		}
-		entries, _ := os.ReadDir(dir)
-		for _, e := range entries {
-			if e.IsDir() && strings.Contains(e.Name(), "NapCat") && strings.Contains(e.Name(), "Shell") {
-				subDir := filepath.Join(dir, e.Name())
-				if _, err := os.Stat(filepath.Join(subDir, "napcat.bat")); err == nil {
-					return subDir
+		found := ""
+		filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err != nil || found != "" {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() {
+				for _, m := range markers {
+					if strings.EqualFold(d.Name(), m) {
+						found = filepath.Dir(path)
+						return filepath.SkipAll
+					}
 				}
 			}
+			return nil
+		})
+		if found != "" {
+			return found
 		}
 	}
 	return ""
@@ -500,14 +507,31 @@ func isPortReachable(port int) bool {
 func checkQQLoginStatus(cfg *config.Config) (loggedIn bool, nickname string, qqID string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// Get WebUI token from container config
+	// Get WebUI token: from local config file on Windows, from Docker on Linux
 	token := ""
-	out, err := exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
-	if err == nil {
-		var webui map[string]interface{}
-		if json.Unmarshal(out, &webui) == nil {
-			if t, ok := webui["token"].(string); ok && t != "" {
-				token = t
+	if runtime.GOOS == "windows" {
+		// Read from local NapCat Shell config directory
+		napcatDir := findNapCatShellDir(cfg)
+		if napcatDir != "" {
+			webuiPath := filepath.Join(napcatDir, "config", "webui.json")
+			if data, err := os.ReadFile(webuiPath); err == nil {
+				var webui map[string]interface{}
+				if json.Unmarshal(data, &webui) == nil {
+					if t, ok := webui["token"].(string); ok && t != "" {
+						token = t
+					}
+				}
+			}
+		}
+	} else {
+		// Linux/macOS: read from Docker container
+		out, err := exec.Command("docker", "exec", "openclaw-qq", "cat", "/app/napcat/config/webui.json").Output()
+		if err == nil {
+			var webui map[string]interface{}
+			if json.Unmarshal(out, &webui) == nil {
+				if t, ok := webui["token"].(string); ok && t != "" {
+					token = t
+				}
 			}
 		}
 	}
