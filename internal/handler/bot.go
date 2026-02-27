@@ -219,7 +219,7 @@ func napcatAuth(cfg *config.Config) string {
 		return napcatCredential
 	}
 	adminCfg := loadAdminConfig(cfg)
-	webuiToken := "openclaw-qq-admin"
+	webuiToken := "clawpanel-qq"
 	if napcat, ok := adminCfg["napcat"].(map[string]interface{}); ok {
 		if t, ok := napcat["webuiToken"].(string); ok && t != "" {
 			webuiToken = t

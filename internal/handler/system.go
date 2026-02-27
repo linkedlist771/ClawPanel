@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/zhaoxinyi02/ClawPanel/internal/config"
+	"github.com/zhaoxinyi02/ClawPanel/internal/process"
 	"github.com/zhaoxinyi02/ClawPanel/internal/update"
 )
 
@@ -171,9 +172,20 @@ func Restore(cfg *config.Config) gin.HandlerFunc {
 }
 
 // RestartGateway 重启 OpenClaw 网关
-func RestartGateway(cfg *config.Config) gin.HandlerFunc {
+func RestartGateway(cfg *config.Config, procMgr *process.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		patchModelsJSON(cfg)
+
+		// If OpenClaw process is not running, start it
+		if !procMgr.GetStatus().Running {
+			if err := procMgr.Start(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"ok": false, "error": "启动 OpenClaw 失败: " + err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"ok": true, "message": "OpenClaw 已启动"})
+			return
+		}
+
 		signalPath := filepath.Join(cfg.OpenClawDir, "restart-gateway-signal.json")
 		data, _ := json.Marshal(map[string]interface{}{
 			"requestedAt": time.Now().Format(time.RFC3339),

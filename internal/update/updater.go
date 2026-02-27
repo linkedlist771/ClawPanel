@@ -200,43 +200,120 @@ func (u *Updater) doUpdateAsync(info *UpdateInfo) {
 	currentBin, _ = filepath.EvalSymlinks(currentBin)
 	u.log("📍 当前程序: %s", currentBin)
 
-	// Backup old binary
-	backupPath := currentBin + ".bak"
-	if runtime.GOOS == "windows" {
-		// Windows can't replace running exe, rename first
-		os.Remove(backupPath)
-		if err := os.Rename(currentBin, backupPath); err != nil {
-			u.setError("备份旧程序失败: %v", err)
+	// Save update popup info before replace (in case restart kills us)
+	u.saveUpdatePopup(info)
+	u.log("💾 更新信息已保存")
+
+	// On Linux/macOS, write an external updater script that:
+	// 1. Stops the service
+	// 2. Replaces the binary (rm + cp)
+	// 3. Starts the service
+	// This avoids corrupting a running binary and the self-restart race condition.
+	if runtime.GOOS != "windows" {
+		scriptPath := filepath.Join(tmpDir, "do-update.sh")
+		script := fmt.Sprintf(`#!/bin/bash
+set -e
+echo "[ClawPanel Updater] 开始更新..."
+
+# Stop service
+echo "[ClawPanel Updater] 停止 ClawPanel 服务..."
+systemctl stop clawpanel 2>/dev/null || true
+sleep 1
+
+# Wait for process to exit (up to 10s)
+for i in $(seq 1 10); do
+  if ! pgrep -x clawpanel >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# Kill if still running
+if pgrep -x clawpanel >/dev/null 2>&1; then
+  echo "[ClawPanel Updater] 强制停止旧进程..."
+  pkill -9 -x clawpanel 2>/dev/null || true
+  sleep 1
+fi
+
+# Backup old binary
+if [ -f "%s" ]; then
+  cp -f "%s" "%s.bak" 2>/dev/null || true
+  echo "[ClawPanel Updater] 已备份旧程序"
+fi
+
+# Replace: remove old then copy new
+rm -f "%s"
+cp -f "%s" "%s"
+chmod +x "%s"
+echo "[ClawPanel Updater] 程序替换完成"
+
+# Start service
+echo "[ClawPanel Updater] 启动 ClawPanel 服务..."
+systemctl start clawpanel 2>/dev/null || ( echo "[ClawPanel Updater] systemctl 启动失败，尝试直接启动..." && nohup "%s" >/dev/null 2>&1 & )
+echo "[ClawPanel Updater] 更新完成!"
+
+# Clean up
+rm -f "%s"
+rm -rf "%s"
+`, currentBin, currentBin, currentBin, currentBin, tmpFile, currentBin, currentBin, currentBin, scriptPath, tmpDir)
+
+		if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+			u.setError("写入更新脚本失败: %v", err)
 			return
 		}
-		u.log("📦 已备份旧程序: %s", backupPath)
-	} else {
-		// Linux/macOS: copy old binary as backup
-		if data, err := os.ReadFile(currentBin); err == nil {
-			os.WriteFile(backupPath, data, 0755)
-			u.log("📦 已备份旧程序: %s", backupPath)
-		}
+		u.log("📝 更新脚本已生成: %s", scriptPath)
+
+		u.setStatus("restarting", 95, "即将停止服务并替换程序...")
+		u.log("🔄 ClawPanel 即将停止，更新脚本将接管...")
+
+		u.mu.Lock()
+		u.progress.Status = "done"
+		u.progress.Progress = 100
+		u.progress.Message = "更新完成，正在重启..."
+		u.progress.FinishedAt = time.Now().Format(time.RFC3339)
+		u.mu.Unlock()
+
+		// Spawn the external script (detached, won't die with us)
+		go func() {
+			time.Sleep(1 * time.Second)
+			cmd := exec.Command("bash", "-c", "setsid bash "+scriptPath+" </dev/null >/dev/null 2>&1 &")
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			if err := cmd.Start(); err != nil {
+				log.Printf("[Updater] 启动更新脚本失败: %v, 尝试直接替换...", err)
+				// Fallback: direct replace + systemctl restart
+				os.Remove(currentBin)
+				copyFile(tmpFile, currentBin)
+				os.Chmod(currentBin, 0755)
+				execCmd("systemctl", "restart", "clawpanel")
+				return
+			}
+			log.Printf("[Updater] 更新脚本已启动 (PID: %d)，等待接管...", cmd.Process.Pid)
+			// Release the child so it doesn't become a zombie
+			cmd.Process.Release()
+		}()
+		return
 	}
 
-	// Copy new binary
+	// Windows path: rename approach
+	backupPath := currentBin + ".bak"
+	os.Remove(backupPath)
+	if err := os.Rename(currentBin, backupPath); err != nil {
+		u.setError("备份旧程序失败: %v", err)
+		return
+	}
+	u.log("📦 已备份旧程序: %s", backupPath)
+
 	if err := copyFile(tmpFile, currentBin); err != nil {
-		// Restore backup on failure
-		if runtime.GOOS == "windows" {
-			os.Rename(backupPath, currentBin)
-		}
+		os.Rename(backupPath, currentBin)
 		u.setError("替换程序失败: %v", err)
 		return
 	}
 	os.Chmod(currentBin, 0755)
 	u.log("✅ 程序替换完成")
 
-	// Clean up temp file
 	os.Remove(tmpFile)
 	os.RemoveAll(tmpDir)
-
-	// Save update popup info
-	u.saveUpdatePopup(info)
-	u.log("💾 更新信息已保存")
 
 	u.setStatus("restarting", 95, "即将重启 ClawPanel...")
 	u.log("🔄 ClawPanel 即将重启，请等待...")
@@ -248,32 +325,14 @@ func (u *Updater) doUpdateAsync(info *UpdateInfo) {
 	u.progress.FinishedAt = time.Now().Format(time.RFC3339)
 	u.mu.Unlock()
 
-	// Restart the service (platform-aware)
 	go func() {
 		time.Sleep(1 * time.Second)
-		switch runtime.GOOS {
-		case "windows":
-			// Try Windows service restart
-			if err := execCmd("net", "stop", "ClawPanel"); err == nil {
-				execCmd("net", "start", "ClawPanel")
-				return
-			}
-			// Fallback: exit
-			log.Printf("[Updater] Windows service restart failed, exiting...")
-			os.Exit(0)
-		case "darwin":
-			// macOS: try launchctl, then fallback to exit
-			if err := execCmd("launchctl", "kickstart", "-k", "system/com.clawpanel.service"); err != nil {
-				log.Printf("[Updater] launchctl restart failed: %v, exiting for manual restart...", err)
-				os.Exit(0)
-			}
-		default:
-			// Linux: try systemctl first
-			if err := execCmd("systemctl", "restart", "clawpanel"); err != nil {
-				log.Printf("[Updater] systemctl restart failed: %v, exiting...", err)
-				os.Exit(0)
-			}
+		if err := execCmd("net", "stop", "ClawPanel"); err == nil {
+			execCmd("net", "start", "ClawPanel")
+			return
 		}
+		log.Printf("[Updater] Windows service restart failed, exiting...")
+		os.Exit(0)
 	}()
 }
 

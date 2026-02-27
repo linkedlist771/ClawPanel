@@ -63,7 +63,7 @@ func (m *Manager) Start() error {
 	}
 
 	// 构建启动命令
-	m.cmd = exec.Command(openclawBin, "start")
+	m.cmd = exec.Command(openclawBin, "gateway")
 	m.cmd.Dir = m.cfg.OpenClawDir
 	m.cmd.Env = append(os.Environ(),
 		fmt.Sprintf("OPENCLAW_DIR=%s", m.cfg.OpenClawDir),
