@@ -87,37 +87,37 @@ fi
 
 # ── 3. 定位 OpenClaw 配置目录 ────────────────────────────────
 title "3. 定位 OpenClaw 配置"
-if [ ! -f "$OPENCLAW_JSON" ]; then
-    # 扫描所有可能路径（包括 /home/* 下的所有用户）
-    for candidate in \
+_scan_openclaw_json() {
+    # 先检查已知路径，再全量扫描 /home 和 /root
+    for _c in \
         "$ACTUAL_HOME/openclaw/config/openclaw.json" \
         "/root/openclaw/config/openclaw.json" \
-        "$ACTUAL_HOME/.openclaw/openclaw.json" \
-        $(find /home -maxdepth 3 -name openclaw.json 2>/dev/null | head -5); do
-        if [ -f "$candidate" ]; then
-            OPENCLAW_JSON="$candidate"
-            OPENCLAW_DIR="$(dirname "$candidate")"
-            break
-        fi
+        "$ACTUAL_HOME/.openclaw/openclaw.json"; do
+        [ -f "$_c" ] && echo "$_c" && return
     done
+    # 全量扫描所有用户家目录
+    find /home /root -maxdepth 4 -name openclaw.json 2>/dev/null | head -5 | while read -r _c; do
+        [ -f "$_c" ] && echo "$_c" && break
+    done
+}
+
+if [ ! -f "$OPENCLAW_JSON" ]; then
+    _found=$(_scan_openclaw_json)
+    if [ -n "$_found" ]; then
+        OPENCLAW_JSON="$_found"
+        OPENCLAW_DIR="$(dirname "$_found")"
+    fi
 fi
+
 if [ -f "$OPENCLAW_JSON" ]; then
     ok "openclaw.json: $OPENCLAW_JSON"
 else
     warn "openclaw.json 未找到，尝试初始化..."
     [ -n "$OC_BIN" ] && "$OC_BIN" init 2>/dev/null || true
-    # 初始化后再次扫描
-    for candidate in \
-        "$ACTUAL_HOME/openclaw/config/openclaw.json" \
-        "/root/openclaw/config/openclaw.json" \
-        $(find /home -maxdepth 3 -name openclaw.json 2>/dev/null | head -5); do
-        if [ -f "$candidate" ]; then
-            OPENCLAW_JSON="$candidate"
-            OPENCLAW_DIR="$(dirname "$candidate")"
-            break
-        fi
-    done
-    if [ -f "$OPENCLAW_JSON" ]; then
+    _found=$(_scan_openclaw_json)
+    if [ -n "$_found" ]; then
+        OPENCLAW_JSON="$_found"
+        OPENCLAW_DIR="$(dirname "$_found")"
         ok "openclaw.json 已初始化: $OPENCLAW_JSON"
     else
         err "初始化失败，请手动运行 'openclaw init' 然后重试"
@@ -139,9 +139,31 @@ fi
 QQ_EXT_DIR="$OPENCLAW_GLOBAL/openclaw/extensions/qq"
 [ -d "$OPENCLAW_GLOBAL/extensions/qq" ] && QQ_EXT_DIR="$OPENCLAW_GLOBAL/extensions/qq"
 
-if [ -d "$QQ_EXT_DIR" ]; then
+# 先从 openclaw.json 读取 installPath（NapCat 模式下 qq 扩展路径在此配置）
+QQ_INSTALL_PATH=""
+if [ -f "$OPENCLAW_JSON" ] && command -v python3 &>/dev/null; then
+    QQ_INSTALL_PATH=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$OPENCLAW_JSON'))
+    p = d.get('plugins',{}).get('installs',{}).get('qq',{}).get('installPath','')
+    print(p)
+except: pass
+" 2>/dev/null)
+fi
+
+if [ -n "$QQ_INSTALL_PATH" ] && [ -d "$QQ_INSTALL_PATH" ]; then
+    ok "QQ 扩展 (plugins.installs.qq): $QQ_INSTALL_PATH"
+    OWNER=$(stat -c '%U' "$QQ_INSTALL_PATH" 2>/dev/null || stat -f '%Su' "$QQ_INSTALL_PATH" 2>/dev/null)
+    if [ "$OWNER" != "root" ]; then
+        warn "QQ 扩展目录所有者为 $OWNER（应为 root），正在修复权限..."
+        chown -R root:root "$QQ_INSTALL_PATH"
+        ok "权限已修复 (root:root)"
+    else
+        ok "文件权限正常 (root:root)"
+    fi
+elif [ -d "$QQ_EXT_DIR" ]; then
     ok "QQ 扩展目录: $QQ_EXT_DIR"
-    # 检查文件权限（需要 root 所有权）
     OWNER=$(stat -c '%U' "$QQ_EXT_DIR" 2>/dev/null || stat -f '%Su' "$QQ_EXT_DIR" 2>/dev/null)
     if [ "$OWNER" != "root" ]; then
         warn "QQ 扩展目录所有者为 $OWNER（应为 root），正在修复权限..."
@@ -151,15 +173,8 @@ if [ -d "$QQ_EXT_DIR" ]; then
         ok "文件权限正常 (root:root)"
     fi
 else
-    warn "QQ 扩展目录不存在: $QQ_EXT_DIR"
-    info "QQ/NapCat 通道依赖 openclaw 内置的 qq 扩展，尝试重装 openclaw..."
-    npm install -g openclaw@latest --registry=https://registry.npmmirror.com
-    if [ -d "$QQ_EXT_DIR" ]; then
-        ok "QQ 扩展已随 openclaw 安装"
-        chown -R root:root "$QQ_EXT_DIR" 2>/dev/null || true
-    else
-        warn "QQ 扩展在此版本的 openclaw 中不存在，可能已内置或路径不同"
-    fi
+    warn "未找到 QQ 扩展目录（plugins.installs.qq.installPath 未配置或目录不存在）"
+    info "请在 ClawPanel 通道配置页面重新配置并启用 QQ 通道，或重装 NapCat 后再试"
 fi
 
 # ── 5. 检测 NapCat Docker 容器 ───────────────────────────────
